@@ -8,8 +8,7 @@ use crate::font_types::KNOWN_TABLE_TAGS;
 use crate::font_data_convert::convert_uint_base128_to_u32;
 
 use std::mem;
-// use std::fs::File;
-// use std::io::{Read, Seek, SeekFrom, Cursor};
+use std::io::Read;
 
 use reqwest::blocking::Client;
 
@@ -31,51 +30,31 @@ fn main() {
     let signature = u32::from_be_bytes(font_data[0..4].try_into()
         .expect("Failed to convert to u32"));
 
-    if signature == 0x774F4632 {
+    // WOFF2
+    if signature == 0x774F4632 { 
         println!("Font is in WOFF2 format");
         let header = woff2_read_header(&font_data);
-        println!("WOFF2 Header: {:?}", header);
-        let table_records = woff2_load_table_records(&font_data, header.num_tables);
-        println!("WOFF2 Table Records: {:?}", table_records);
+        println!("WOFF2 Header: {:#?}", header);
+        let (table_records, actual_size, offset) = woff2_load_table_records(&font_data, header.num_tables);
+        println!("WOFF2 Table Records: {:#?}", table_records);
+        println!("Actual size of uncompressed data: {}", actual_size);
+        println!("Offset after reading table records: {}", offset);
+        println!("End of compressed data: {}", offset + header.total_compressed_size as usize);
+
+        let compressed_end = offset + header.total_compressed_size as usize;
+        let mut decompressor = brotli::Decompressor::new(&font_data[offset..compressed_end], header.total_sfnt_size as usize);
+        let mut table_data = Vec::new();
+        decompressor.read_to_end(&mut table_data).expect("Failed to decompress table data");
+        println!("Decompressed table data length: {}", table_data.len());
+    // TrueType
     } else if signature == 0x00010000 || signature == 0x74727565 {
         println!("Font is in TTF format");
+    // OTF
     } else if signature == 0x4F54544F {
         println!("Font is in OTF format");
     } else {
         println!("Unknown font format");
     }
-
-
-    // let mut font_file = File::open("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-    //     .expect("Failed to open font file");
-
-    // let mut buffer = [0u8; 12];
-    // font_file.read_exact(&mut buffer).expect("Failed to read from font file");
-    // println!("Buffer bytes: {:02X?}", buffer);
-
-    // let mut reader = Cursor::new(buffer);
-    // reader.read_exact(&mut buffer).expect("Failed to read from cursor");
-
-    // let sfnt_version: u32 = u32::from_be_bytes(buffer[0..4].try_into()
-    //     .expect("Failed to convert to u32"));
-
-    // let num_tables: u16 = u16::from_be_bytes(buffer[4..6].try_into()
-    //     .expect("Failed to convert to u16"));
-
-    // let search_range: u16 = u16::from_be_bytes(buffer[6..8].try_into()
-    //     .expect("Failed to convert to u16"));
-
-    // let entry_selector: u16 = u16::from_be_bytes(buffer[8..10].try_into()
-    //     .expect("Failed to convert to u16"));
-
-    // let range_shift: u16 = u16::from_be_bytes(buffer[10..12].try_into()
-    //     .expect("Failed to convert to u16"));
-
-    // println!("SFNT Version: {:08X}", sfnt_version);
-    // println!("Number of Tables: {}", num_tables);
-    // println!("Search Range: {}", search_range);
-    // println!("Entry Selector: {}", entry_selector);
-    // println!("Range Shift: {}", range_shift);
 }
 
 fn woff2_read_header(data: &[u8]) -> Woff2Header {
@@ -97,14 +76,16 @@ fn woff2_read_header(data: &[u8]) -> Woff2Header {
     }
 }
 
-fn woff2_load_table_records(data: &[u8], num_tables: u16) -> Vec<font_types::Woff2TableRecord> {
+fn woff2_load_table_records(data: &[u8], num_tables: u16) -> (Vec<font_types::Woff2TableRecord>, u32, usize) {
     let mut records = Vec::new();
+    let mut actual_size = 0;
     let mut offset = mem::size_of::<Woff2Header>(); // Start after the header
     println!("Starting to read table records at offset: {}", offset);
 
     for _ in 0..num_tables {
         // Read the flags byte to determine the known_table_tag and transform_version
-        let flags = data[offset];
+        let flags: u8 = data[offset];
+        println!("Flags binary: {:08b}", flags);
         offset += 1; // Move past the flags byte
         let known_table_tag = flags & 0x3F;
         let transform_version = (flags >> 6) & 0x03;
@@ -126,8 +107,24 @@ fn woff2_load_table_records(data: &[u8], num_tables: u16) -> Vec<font_types::Wof
         };
 
         // Read the original_length and transform_length using Base128 encoding
-        let (original_length, original_length_bytes) = convert_uint_base128_to_u32(data, offset + 5);
-        let (transform_length, transform_length_bytes) = convert_uint_base128_to_u32(data, offset + 5 + original_length_bytes);
+        let (original_length, original_length_bytes) = convert_uint_base128_to_u32(data, offset);
+        offset += original_length_bytes; // Move past the original_length bytes
+
+        let needs_transform_length =
+            matches!(tag.as_str(), "glyf" | "loca" | "htmx") || transform_version != 0;
+
+        let transform_length = if needs_transform_length {
+            println!(
+                "Transform version {} detected, reading transform_length",
+                transform_version
+            );
+            let (transform_length, transform_length_bytes) = convert_uint_base128_to_u32(data, offset);
+            offset += transform_length_bytes;
+            transform_length
+        } else {
+            0
+        };
+    
 
         records.push(font_types::Woff2TableRecord {
             known_table_tag,
@@ -137,8 +134,8 @@ fn woff2_load_table_records(data: &[u8], num_tables: u16) -> Vec<font_types::Wof
             transform_length,
         });
 
-        offset += original_length_bytes + transform_length_bytes; // Move to the next record
+        actual_size += original_length; // Accumulate the actual size of the uncompressed data
     }
 
-    records
+    (records, actual_size, offset)
 }
